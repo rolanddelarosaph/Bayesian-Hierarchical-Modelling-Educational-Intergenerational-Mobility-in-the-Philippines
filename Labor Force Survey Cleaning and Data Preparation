@@ -1,0 +1,309 @@
+import pandas as pd
+
+# ============================================
+# READ & SELECT DATA
+# ============================================
+
+# Read the CSV file into a pandas DataFrame
+raw_data = pd.read_csv("/Users/rolanddelarosa/Desktop/THESIS VERSION 2/EXCEL FILES ONLY /LFS PUF Q1 2024.CSV")
+
+# Select and rename the specified columns for better readability and usability.
+# This step ensures that we only work with relevant data and have descriptive column names.
+DataFiltered1 = raw_data[[
+    'PUFREG', 'PUFHHNUM', 'PUFHHSIZE', 'PUFC03_REL',
+    'PUFC04_SEX', 'PUFC05_AGE', 'PUFC06_MSTAT', 'PUFC07_GRADE',
+    'PUFC08_CURSCH', 'PUFC14_PROCC', 'PUFC25_PBASIC', 'PUFC17_NATEM',
+    'PUFC23_PCLASS', 'PUFC18_PNWHRS', 'PUFC26_OJOB', 'PUFC22_PFWRK'
+]].rename(columns={
+    'PUFREG': 'Region',
+    'PUFHHNUM': 'Household_Number',
+    'PUFHHSIZE': 'Total_Household_Members',
+    'PUFC03_REL': 'Family_Relationship',
+    'PUFC04_SEX': 'Sex',
+    'PUFC05_AGE': 'Age',
+    'PUFC06_MSTAT': 'Marital_Status',
+    'PUFC07_GRADE': 'Highest_Grade_Completed',
+    'PUFC08_CURSCH': 'Currently_Attending_School',
+    'PUFC14_PROCC': 'Primary_Occupation',
+    'PUFC25_PBASIC': 'WagePerDay',
+    'PUFC17_NATEM': 'Nature_of_Employment',
+    'PUFC23_PCLASS': 'Class_of_Worker',
+    'PUFC18_PNWHRS': 'Working_Hours_PerDay',
+    'PUFC26_OJOB': 'Other_Job_indicator',
+    'PUFC22_PFWRK': 'First_Time_Work'
+})
+
+# ============================================
+# DATA CLEANING PROCESS
+# ============================================
+# Create an initial copy to work on for the cleaning process.
+LFS_clean_base = DataFiltered1.copy()
+
+# Step 1: Convert 'Family_Relationship' to numeric.
+# This ensures consistency for all subsequent filtering and calculations involving this column.
+# 'errors="coerce"' will turn any non-numeric values into NaN, which is generally desired for clean data.
+LFS_clean_base['Family_Relationship'] = pd.to_numeric(LFS_clean_base['Family_Relationship'], errors='coerce')
+
+# Step 2: Calculate Children_Per_Household.
+# This step calculates the number of children (Family_Relationship == 3) within each household
+# *before* any major filtering that might remove children.
+# We now use the numeric '3' since we converted the column.
+LFS_clean_base['Children_Per_Household'] = LFS_clean_base.groupby('Household_Number')['Family_Relationship'].transform(lambda x: (x == 3).sum())
+
+# Step 3: Filter out specific 'Highest_Grade_Completed' and 'Primary_Occupation' codes.
+# These codes are considered invalid or irrelevant for the analysis (SPED, special educations).
+grades_to_exclude = ["24004", "24005", "24006", "10004", "10005", "10006", "10002", "24002"]
+occupations_to_exclude = ["01", "02", "03", "1", "2", "3"]
+
+LFS_clean_1 = LFS_clean_base[
+    (~LFS_clean_base['Highest_Grade_Completed'].astype(str).isin(grades_to_exclude)) &
+    (~LFS_clean_base['Primary_Occupation'].astype(str).isin(occupations_to_exclude))
+].copy() # .copy() to prevent SettingWithCopyWarning when filtering
+
+# Step 4: Remove individuals currently attending school.
+# We exclude individuals who are still in school
+LFS_clean_2 = LFS_clean_1[
+    (LFS_clean_1['Currently_Attending_School'] != 1) | (LFS_clean_1['Currently_Attending_School'].isna())
+].copy()
+
+# Step 5: Keep only household head, spouse, or child.
+# 'Family_Relationship' is already numeric from Step 1.
+LFS_clean_3 = LFS_clean_2[LFS_clean_2['Family_Relationship'].isin([1, 2, 3])].copy() # .copy()
+
+# Step 6: Keep only households with at least one parent (1 or 2) AND at least one child (3).
+# This ensures that we analyze only complete family units with both parents and children present.
+eligible_households = LFS_clean_3.groupby('Household_Number').agg(
+    has_parent=('Family_Relationship', lambda x: any(rel in [1, 2] for rel in x)),
+    has_child=('Family_Relationship', lambda x: any(rel == 3 for rel in x))
+).query('has_parent & has_child').index
+
+LFS_clean_4 = LFS_clean_3[LFS_clean_3['Household_Number'].isin(eligible_households)].copy() # .copy()
+
+# Step 7: Add Year and Quarter columns at the beginning.
+# Note: LFS_clean_4 already has 'Children_Per_Household' calculated accurately from LFS_clean_base.
+LFS_clean_final = LFS_clean_4.copy()
+LFS_clean_final['Year'] = 2024
+LFS_clean_final['Quarter'] = 1
+LFS_clean_final = LFS_clean_final[['Year', 'Quarter'] + [col for col in LFS_clean_final.columns if col not in ['Year', 'Quarter']]]
+
+
+# ===============================================================
+# COMBINING DATA OF PARENT-CHILD PAIRS IN ROWS
+# ===============================================================
+
+# Step 1: Remove unnecessary columns
+# These columns are no longer needed for the parent-child pairing.
+LFS_clean_pairs_base = LFS_clean_final.drop(columns=['Currently_Attending_School', 'First_Time_Work'])
+
+# Step 2: Separate parents and children into different DataFrames.
+# This prepares the data for merging, allowing us to combine parent and child information.
+parents = LFS_clean_pairs_base[LFS_clean_pairs_base['Family_Relationship'].isin([1, 2])].copy()
+parents.columns = ['Parent_' + col if col not in ['Year', 'Quarter', 'Region', 'Household_Number', 'Children_Per_Household'] else col for col in parents.columns]
+
+children = LFS_clean_pairs_base[LFS_clean_pairs_base['Family_Relationship'] == 3].copy()
+children.columns = ['Child_' + col if col not in ['Year', 'Quarter', 'Region', 'Household_Number', 'Children_Per_Household'] else col for col in children.columns]
+
+# Step 3: Perform all combinations of parent-child within the same household.
+# This creates a new DataFrame where each row represents a unique parent-child pair within a household.
+parent_child_pairs = pd.merge(
+    parents,
+    children,
+    on=["Year", "Quarter", "Household_Number", "Region", "Children_Per_Household"],
+    how="inner"
+)
+
+
+# ================================================================
+# ASSIGNING THE DATA LEGENDS for Educational Attainment and Occupation
+# ================================================================
+
+# Define the mapping of codes to grade descriptions.
+# This dictionary helps translate numerical codes into more understandable educational levels.
+grade_mapping = {
+    "00000": "No Grade Completed",
+    "01000": "Nursery",
+    "02000": "Kindergarten",
+    # Elementary Levels
+    "10011": "Grade 1", "10012": "Grade 2", "10013": "Grade 3", "10014": "Grade 4", "10015": "Grade 5",
+    "10016": "Elementary Graduate / Grade 6 Completer", "10017": "Elementary Graduate / Grade 6 Completer", "10018": "Elementary Graduate / Grade 6 Completer",
+    "10004": "IPED", "10005": "Madrasah", "10006": "SPED",
+    # Junior High School
+    "24011": "Grade 7 / 1st Year Junior High", "24012": "Grade 8 / 2nd Year Junior High", "24013": "Grade 9 / 3rd Year Junior High",
+    "24004": "IPED (Junior High)", "24005": "Madrasah (Junior High)", "24006": "SPED (Junior High)",
+    "24014": "Junior High Graduate", "24015": "Junior High Graduate",
+    # Senior High School
+    "34011": "Grade 11 - Academic Track", "34021": "Grade 11 - Arts & Design Track", "34031": "Grade 11 - Tech-Voc Track",
+    "34013": "Grade 12 Graduate - Academic Track", "34023": "Grade 12 Graduate - Arts & Design Track", "34033": "Grade 12 Graduate - Tech-Voc Track",
+    "35011": "Grade 11 - Sports Track", "35013": "Grade 12 Graduate - Sports Track"
+}
+
+# Apply the grade mapping to both parent and child highest grade completed columns.
+# This also handles numerical ranges for post-secondary and college levels using a function.
+def map_grade(grade_code):
+    if grade_code in grade_mapping:
+        return grade_mapping[grade_code]
+    elif grade_code.isdigit():
+        code_int = int(grade_code)
+        if 40001 <= code_int <= 40003 or 50001 <= code_int <= 50003:
+            return "Post-Secondary Non-Tertiary Undergraduate"
+        elif 40011 <= code_int <= 49999 or 50011 <= code_int <= 59999:
+            return "Post-Secondary Non-Tertiary Graduate"
+        elif code_int == 60001:
+            return "1st Year Bachelor Level"
+        elif code_int == 60002:
+            return "2nd Year Bachelor Level"
+        elif code_int == 60003:
+            return "3rd Year Bachelor Level"
+        elif code_int == 60004:
+            return "4th Year Bachelor Level"
+        elif code_int == 60005:
+            return "5th Year Bachelor Level"
+        elif code_int == 60006:
+            return "6th Year Bachelor Level"
+        elif code_int == 60000 or (60011 <= code_int <= 69999) or \
+             (70000 <= code_int <= 79999) or (80000 <= code_int <= 89999):
+            return "College Graduate"
+    return "Unknown"
+
+parent_child_pairs['Parent_Highest_Grade_Completed'] = parent_child_pairs['Parent_Highest_Grade_Completed'].astype(str).apply(map_grade)
+parent_child_pairs['Child_Highest_Grade_Completed'] = parent_child_pairs['Child_Highest_Grade_Completed'].astype(str).apply(map_grade)
+
+
+# Define the updated mapping for Primary_Occupation codes.
+# This simplifies granular occupation codes into broader categories.
+occupation_mapping = {
+    "11": "1", "12": "1", "13": "1", "14": "1",
+    "21": "2", "22": "2", "23": "2", "24": "2", "25": "2", "26": "2",
+    "31": "3", "32": "3", "33": "3", "34": "3", "35": "3",
+    "41": "4", "42": "4", "43": "4", "44": "4",
+    "51": "5", "52": "5", "53": "5", "54": "5",
+    "61": "6", "62": "6", "63": "6",
+    "71": "7", "72": "7", "73": "7", "74": "7", "75": "7",
+    "81": "8", "82": "8", "83": "8",
+    "91": "9", "92": "9", "93": "9", "94": "9", "95": "9", "96": "9"
+}
+
+# Apply the occupation mapping to both parent and child primary occupation columns.
+parent_child_pairs['Parent_Primary_Occupation'] = parent_child_pairs['Parent_Primary_Occupation'].astype(str).replace(occupation_mapping)
+parent_child_pairs['Child_Primary_Occupation'] = parent_child_pairs['Child_Primary_Occupation'].astype(str).replace(occupation_mapping)
+
+
+# ========================================================================
+# CREATING NEW COLUMNS FOR PARENT EDUCATIONAL ATTAINMENT AND YEARS OF SCHOOLING
+# ========================================================================
+
+# Calculate Parent_Educational_Attainment and Parent_Schooling_Years based on mapped grades.
+# This categorizes educational levels and assigns corresponding years of schooling.
+parent_child_pairs['Parent_Educational_Attainment'] = parent_child_pairs['Parent_Highest_Grade_Completed'].apply(lambda x:
+    1 if x == "No Grade Completed" or x in ["Nursery", "Kindergarten"] else
+    2 if x in ["Grade 1", "Grade 2", "Grade 3", "Grade 4", "Grade 5"] else
+    3 if x == "Elementary Graduate / Grade 6 Completer" else
+    4 if x in ["Grade 7 / 1st Year Junior High", "Grade 8 / 2nd Year Junior High", "Grade 9 / 3rd Year Junior High"] else
+    5 if x == "Junior High Graduate" or x.startswith("Grade 11") or x.startswith("Grade 12 Graduate") else # Senior High
+    6 if x == "Post-Secondary Non-Tertiary Undergraduate" else
+    7 if x == "Post-Secondary Non-Tertiary Graduate" else
+    8 if x.endswith("Bachelor Level") else
+    9 if x == "College Graduate" else
+    pd.NA
+)
+
+parent_child_pairs['Parent_Schooling_Years'] = parent_child_pairs['Parent_Highest_Grade_Completed'].apply(lambda x:
+    0 if x == "No Grade Completed" or x in ["Nursery", "Kindergarten"] else
+    1 if x == "Grade 1" else 2 if x == "Grade 2" else 3 if x == "Grade 3" else 4 if x == "Grade 4" else 5 if x == "Grade 5" else
+    6 if x == "Elementary Graduate / Grade 6 Completer" else
+    7 if x == "Grade 7 / 1st Year Junior High" else 8 if x == "Grade 8 / 2nd Year Junior High" else 9 if x == "Grade 9 / 3rd Year Junior High" else
+    10 if x == "Junior High Graduate" or x.startswith("Grade 11") or x.startswith("Grade 12 Graduate") else # Senior High
+    11 if x == "Post-Secondary Non-Tertiary Undergraduate" or x == "1st Year Bachelor Level" else
+    12 if x == "Post-Secondary Non-Tertiary Graduate" or x == "2nd Year Bachelor Level" else
+    13 if x == "3rd Year Bachelor Level" else
+    14 if x in ["4th Year Bachelor Level", "5th Year Bachelor Level", "6th Year Bachelor Level", "College Graduate"] else
+    pd.NA
+)
+
+
+# Calculate Child_Educational_Attainment and Child_Schooling_Years based on mapped grades.
+# Similar to parents, this categorizes educational levels and assigns years of schooling for children.
+parent_child_pairs['Child_Educational_Attainment'] = parent_child_pairs['Child_Highest_Grade_Completed'].apply(lambda x:
+    1 if x == "No Grade Completed" or x in ["Nursery", "Kindergarten"] else
+    2 if x in ["Grade 1", "Grade 2", "Grade 3", "Grade 4", "Grade 5"] else
+    3 if x == "Elementary Graduate / Grade 6 Completer" else
+    4 if x in ["Grade 7 / 1st Year Junior High", "Grade 8 / 2nd Year Junior High", "Grade 9 / 3rd Year Junior High"] else
+    5 if x == "Junior High Graduate" or x.startswith("Grade 11") or x.startswith("Grade 12 Graduate") else # Senior High
+    6 if x == "Post-Secondary Non-Tertiary Undergraduate" else
+    7 if x == "Post-Secondary Non-Tertiary Graduate" else
+    8 if x.endswith("Bachelor Level") else
+    9 if x == "College Graduate" else
+    pd.NA
+)
+
+parent_child_pairs['Child_Schooling_Years'] = parent_child_pairs['Child_Highest_Grade_Completed'].apply(lambda x:
+    0 if x == "No Grade Completed" or x in ["Nursery", "Kindergarten"] else
+    1 if x == "Grade 1" else 2 if x == "Grade 2" else 3 if x == "Grade 3" else 4 if x == "Grade 4" else 5 if x == "Grade 5" else
+    6 if x == "Elementary Graduate / Grade 6 Completer" else
+    7 if x == "Grade 7 / 1st Year Junior High" else 8 if x == "Grade 8 / 2nd Year Junior High" else 9 if x == "Grade 9 / 3rd Year Junior High" else
+    10 if x == "Junior High Graduate" or x.startswith("Grade 11") or x.startswith("Grade 12 Graduate") else # Senior High
+    11 if x == "Post-Secondary Non-Tertiary Undergraduate" or x == "1st Year Bachelor Level" else
+    12 if x == "Post-Secondary Non-Tertiary Graduate" or x == "2nd Year Bachelor Level" else
+    13 if x == "3rd Year Bachelor Level" else
+    14 if x in ["4th Year Bachelor Level", "5th Year Bachelor Level", "6th Year Bachelor Level", "College Graduate"] else
+    pd.NA
+)
+
+
+# ==========================================================
+# CLEANING THE DATA BASED ON AGE
+# ==========================================================
+
+# Filter out data where parent's age is greater than 80 or child's age is less than 20.
+# This step ensures that the analysis focuses on a relevant age demographic.
+filtered_data = parent_child_pairs[(parent_child_pairs['Parent_Age'] <= 80) & (parent_child_pairs['Child_Age'] >= 20)]
+
+# ==============================================
+# FINALIZING THE DATA FILE
+# ==============================================
+
+# Select and reorder the final columns for the output DataFrame.
+# This organizes the data in a logical and presentable manner.
+final_pairs = filtered_data[[
+    'Year', 'Quarter', 'Region', 'Household_Number',
+    'Children_Per_Household', 'Parent_Sex', 'Child_Sex', 'Parent_Age',
+    'Child_Age', 'Parent_Marital_Status', 'Child_Marital_Status',
+    'Parent_Educational_Attainment', 'Child_Educational_Attainment',
+    'Parent_Schooling_Years', 'Child_Schooling_Years',
+    'Parent_Primary_Occupation', 'Child_Primary_Occupation',
+    'Parent_WagePerDay', 'Child_WagePerDay',
+    'Parent_Nature_of_Employment', 'Child_Nature_of_Employment',
+    'Parent_Class_of_Worker', 'Child_Class_of_Worker',
+    'Parent_Other_Job_indicator', 'Child_Other_Job_indicator'
+]]
+
+# Generate sequential IDs based on unique Household_Number.
+# This creates a new, anonymized household identifier for the final dataset.
+household_seq = final_pairs[['Household_Number']].drop_duplicates().sort_values('Household_Number')
+household_seq['New_Household_Number'] = [f"2024-01-{i:02d}" for i in range(1, len(household_seq) + 1)]
+
+# Join the new sequential IDs back to the final_pairs DataFrame and reorganize columns.
+FINAL_CLEANED_DATA = pd.merge(final_pairs, household_seq, on='Household_Number', how='left')
+FINAL_CLEANED_DATA['OrigHHNUM'] = FINAL_CLEANED_DATA['Household_Number'] # Keep original household number
+FINAL_CLEANED_DATA['Household_Number'] = FINAL_CLEANED_DATA['New_Household_Number'] # Replace with new ID
+
+# Reorder columns to place 'OrigHHNUM' first.
+FINAL_CLEANED_DATA = FINAL_CLEANED_DATA[[
+    'OrigHHNUM', 'Year', 'Quarter', 'Household_Number', 'Region',
+    'Children_Per_Household'
+] + [col for col in FINAL_CLEANED_DATA.columns if col not in ['OrigHHNUM', 'Year', 'Quarter', 'Household_Number', 'Region', 'Children_Per_Household', 'New_Household_Number']]]
+
+
+# =============================================
+# EXPORT THE FINAL CLEANED DATA
+# =============================================
+
+# Define the output file path.
+# We're removing the backslashes that Terminal uses to escape spaces.
+# Python interprets spaces directly within quoted strings.
+file_path = "/Users/rolanddelarosa/Desktop/THESIS VERSION 2/Cleaned Files 1/2024Q1_CleanedData.xlsx"
+
+# Export the final cleaned data to an Excel file.
+# The `index=False` argument prevents pandas from writing the DataFrame index as a column in the Excel file.
+# This keeps your Excel output clean and focused on your data.
+FINAL_CLEANED_DATA.to_excel(file_path, index=False)
